@@ -24,3 +24,9 @@ type ModuleStorer interface {
 	// new empty Storer is returned
 	Module(name string) (Storer, error)
 }
+
+// Worktreer  worktree storer
+type Worktreer interface {
+	storer.ReferenceStorer
+	storer.IndexStorer
+}

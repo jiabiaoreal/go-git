@@ -7,10 +7,15 @@ import (
 	"fmt"
 	stdioutil "io/ioutil"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
+	multierror "github.com/hashicorp/go-multierror"
+	pkgerrs "github.com/pkg/errors"
+	"gopkg.in/src-d/go-billy.v3/osfs"
 	"gopkg.in/src-d/go-git.v4/plumbing"
+	"gopkg.in/src-d/go-git.v4/plumbing/format/worktree"
 	"gopkg.in/src-d/go-git.v4/utils/ioutil"
 
 	"gopkg.in/src-d/go-billy.v3"
@@ -26,11 +31,17 @@ const (
 	objectsPath    = "objects"
 	packPath       = "pack"
 	refsPath       = "refs"
+	worktreePath   = "worktrees"
+	commondirPath  = "commondir"
+	gitdirPath     = "gitdir"
 
 	tmpPackedRefsPrefix = "._packed-refs"
 
 	packExt = ".pack"
 	idxExt  = ".idx"
+
+	// DefaultWorktree default worktree name
+	DefaultWorktree = "default"
 )
 
 var (
@@ -57,7 +68,8 @@ var (
 // The DotGit type represents a local git repository on disk. This
 // type is not zero-value-safe, use the New function to initialize it.
 type DotGit struct {
-	fs                billy.Filesystem
+	commonDir         billy.Filesystem
+	gitDir            billy.Filesystem
 	cachedPackedRefs  refCache
 	packedRefsLastMod time.Time
 }
@@ -65,21 +77,52 @@ type DotGit struct {
 // New returns a DotGit value ready to be used. The path argument must
 // be the absolute path of a git repository directory (e.g.
 // "/foo/bar/.git").
-func New(fs billy.Filesystem) *DotGit {
-	return &DotGit{fs: fs, cachedPackedRefs: make(refCache)}
+func New(gitDir billy.Filesystem) *DotGit {
+	d, err := newFromGitDir(gitDir)
+	if err != nil {
+		d = &DotGit{
+			commonDir:        gitDir,
+			gitDir:           nil,
+			cachedPackedRefs: make(refCache),
+		}
+	}
+
+	return d
+}
+
+func newFromGitDir(gitDir billy.Filesystem) (*DotGit, error) {
+	commonDir := gitDir
+	gitdir := gitDir
+
+	f, err := gitDir.Open(gitDir.Join(commondirPath))
+	defer ioutil.CheckClose(f, &err)
+	if err == nil {
+		cd, _ := stdioutil.ReadAll(f)
+		cdir := strings.TrimSpace(string(cd))
+		commonDir = osfs.New(cdir)
+	} else if os.IsNotExist(err) {
+		gitdir = nil
+	} else {
+		return nil, pkgerrs.Wrap(err, "git: get git common dir :%v")
+	}
+
+	return &DotGit{commonDir: commonDir,
+		gitDir:           gitdir,
+		cachedPackedRefs: make(refCache),
+	}, nil
 }
 
 // Initialize creates all the folder scaffolding.
 func (d *DotGit) Initialize() error {
 	mustExists := []string{
-		d.fs.Join("objects", "info"),
-		d.fs.Join("objects", "pack"),
-		d.fs.Join("refs", "heads"),
-		d.fs.Join("refs", "tags"),
+		d.commonDir.Join("objects", "info"),
+		d.commonDir.Join("objects", "pack"),
+		d.commonDir.Join("refs", "heads"),
+		d.commonDir.Join("refs", "tags"),
 	}
 
 	for _, path := range mustExists {
-		_, err := d.fs.Stat(path)
+		_, err := d.commonDir.Stat(path)
 		if err == nil {
 			continue
 		}
@@ -88,7 +131,7 @@ func (d *DotGit) Initialize() error {
 			return err
 		}
 
-		if err := d.fs.MkdirAll(path, os.ModeDir|os.ModePerm); err != nil {
+		if err := d.commonDir.MkdirAll(path, os.ModeDir|os.ModePerm); err != nil {
 			return err
 		}
 	}
@@ -98,32 +141,38 @@ func (d *DotGit) Initialize() error {
 
 // ConfigWriter returns a file pointer for write to the config file
 func (d *DotGit) ConfigWriter() (billy.File, error) {
-	return d.fs.Create(configPath)
+	return d.commonDir.Create(configPath)
 }
 
 // Config returns a file pointer for read to the config file
 func (d *DotGit) Config() (billy.File, error) {
-	return d.fs.Open(configPath)
+	return d.commonDir.Open(configPath)
 }
 
 // IndexWriter returns a file pointer for write to the index file
 func (d *DotGit) IndexWriter() (billy.File, error) {
-	return d.fs.Create(indexPath)
+	if d.gitDir != nil {
+		return d.gitDir.Create(indexPath)
+	}
+	return d.commonDir.Create(indexPath)
 }
 
 // Index returns a file pointer for read to the index file
 func (d *DotGit) Index() (billy.File, error) {
-	return d.fs.Open(indexPath)
+	if d.gitDir != nil {
+		return d.gitDir.Open(indexPath)
+	}
+	return d.commonDir.Open(indexPath)
 }
 
 // ShallowWriter returns a file pointer for write to the shallow file
 func (d *DotGit) ShallowWriter() (billy.File, error) {
-	return d.fs.Create(shallowPath)
+	return d.commonDir.Create(shallowPath)
 }
 
 // Shallow returns a file pointer for read to the shallow file
 func (d *DotGit) Shallow() (billy.File, error) {
-	f, err := d.fs.Open(shallowPath)
+	f, err := d.commonDir.Open(shallowPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -138,13 +187,13 @@ func (d *DotGit) Shallow() (billy.File, error) {
 // NewObjectPack return a writer for a new packfile, it saves the packfile to
 // disk and also generates and save the index for the given packfile.
 func (d *DotGit) NewObjectPack() (*PackWriter, error) {
-	return newPackWrite(d.fs)
+	return newPackWrite(d.commonDir)
 }
 
 // ObjectPacks returns the list of availables packfiles
 func (d *DotGit) ObjectPacks() ([]plumbing.Hash, error) {
-	packDir := d.fs.Join(objectsPath, packPath)
-	files, err := d.fs.ReadDir(packDir)
+	packDir := d.commonDir.Join(objectsPath, packPath)
+	files, err := d.commonDir.ReadDir(packDir)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -170,9 +219,9 @@ func (d *DotGit) ObjectPacks() ([]plumbing.Hash, error) {
 
 // ObjectPack returns a fs.File of the given packfile
 func (d *DotGit) ObjectPack(hash plumbing.Hash) (billy.File, error) {
-	file := d.fs.Join(objectsPath, packPath, fmt.Sprintf("pack-%s.pack", hash.String()))
+	file := d.commonDir.Join(objectsPath, packPath, fmt.Sprintf("pack-%s.pack", hash.String()))
 
-	pack, err := d.fs.Open(file)
+	pack, err := d.commonDir.Open(file)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrPackfileNotFound
@@ -186,8 +235,8 @@ func (d *DotGit) ObjectPack(hash plumbing.Hash) (billy.File, error) {
 
 // ObjectPackIdx returns a fs.File of the index file for a given packfile
 func (d *DotGit) ObjectPackIdx(hash plumbing.Hash) (billy.File, error) {
-	file := d.fs.Join(objectsPath, packPath, fmt.Sprintf("pack-%s.idx", hash.String()))
-	idx, err := d.fs.Open(file)
+	file := d.commonDir.Join(objectsPath, packPath, fmt.Sprintf("pack-%s.idx", hash.String()))
+	idx, err := d.commonDir.Open(file)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ErrPackfileNotFound
@@ -201,13 +250,13 @@ func (d *DotGit) ObjectPackIdx(hash plumbing.Hash) (billy.File, error) {
 
 // NewObject return a writer for a new object file.
 func (d *DotGit) NewObject() (*ObjectWriter, error) {
-	return newObjectWriter(d.fs)
+	return newObjectWriter(d.commonDir)
 }
 
 // Objects returns a slice with the hashes of objects found under the
 // .git/objects/ directory.
 func (d *DotGit) Objects() ([]plumbing.Hash, error) {
-	files, err := d.fs.ReadDir(objectsPath)
+	files, err := d.commonDir.ReadDir(objectsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, nil
@@ -220,7 +269,7 @@ func (d *DotGit) Objects() ([]plumbing.Hash, error) {
 	for _, f := range files {
 		if f.IsDir() && len(f.Name()) == 2 && isHex(f.Name()) {
 			base := f.Name()
-			d, err := d.fs.ReadDir(d.fs.Join(objectsPath, base))
+			d, err := d.commonDir.ReadDir(d.commonDir.Join(objectsPath, base))
 			if err != nil {
 				return nil, err
 			}
@@ -237,9 +286,9 @@ func (d *DotGit) Objects() ([]plumbing.Hash, error) {
 // Object return a fs.File pointing the object file, if exists
 func (d *DotGit) Object(h plumbing.Hash) (billy.File, error) {
 	hash := h.String()
-	file := d.fs.Join(objectsPath, hash[0:2], hash[2:40])
+	file := d.commonDir.Join(objectsPath, hash[0:2], hash[2:40])
 
-	return d.fs.Open(file)
+	return d.commonDir.Open(file)
 }
 
 func (d *DotGit) SetRef(r *plumbing.Reference) error {
@@ -251,7 +300,12 @@ func (d *DotGit) SetRef(r *plumbing.Reference) error {
 		content = fmt.Sprintln(r.Hash().String())
 	}
 
-	f, err := d.fs.Create(r.Name().String())
+	fs := d.commonDir
+	if r.Name() == plumbing.HEAD && d.gitDir != nil {
+		fs = d.gitDir
+	}
+
+	f, err := fs.Create(r.Name().String())
 	if err != nil {
 		return err
 	}
@@ -293,7 +347,7 @@ func (d *DotGit) Ref(name plumbing.ReferenceName) (*plumbing.Reference, error) {
 }
 
 func (d *DotGit) syncPackedRefs() error {
-	fi, err := d.fs.Stat(packedRefsPath)
+	fi, err := d.commonDir.Stat(packedRefsPath)
 	if os.IsNotExist(err) {
 		return nil
 	}
@@ -304,7 +358,7 @@ func (d *DotGit) syncPackedRefs() error {
 
 	if d.packedRefsLastMod.Before(fi.ModTime()) {
 		d.cachedPackedRefs = make(refCache)
-		f, err := d.fs.Open(packedRefsPath)
+		f, err := d.commonDir.Open(packedRefsPath)
 		if err != nil {
 			if os.IsNotExist(err) {
 				return nil
@@ -347,10 +401,10 @@ func (d *DotGit) packedRef(name plumbing.ReferenceName) (*plumbing.Reference, er
 
 // RemoveRef removes a reference by name.
 func (d *DotGit) RemoveRef(name plumbing.ReferenceName) error {
-	path := d.fs.Join(".", name.String())
-	_, err := d.fs.Stat(path)
+	path := d.commonDir.Join(".", name.String())
+	_, err := d.commonDir.Stat(path)
 	if err == nil {
-		return d.fs.Remove(path)
+		return d.commonDir.Remove(path)
 	}
 
 	if err != nil && !os.IsNotExist(err) {
@@ -376,7 +430,7 @@ func (d *DotGit) addRefsFromPackedRefs(refs *[]*plumbing.Reference, seen map[plu
 }
 
 func (d *DotGit) rewritePackedRefsWithoutRef(name plumbing.ReferenceName) (err error) {
-	f, err := d.fs.Open(packedRefsPath)
+	f, err := d.commonDir.Open(packedRefsPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -387,7 +441,7 @@ func (d *DotGit) rewritePackedRefsWithoutRef(name plumbing.ReferenceName) (err e
 
 	// Creating the temp file in the same directory as the target file
 	// improves our chances for rename operation to be atomic.
-	tmp, err := d.fs.TempFile("", tmpPackedRefsPrefix)
+	tmp, err := d.commonDir.TempFile("", tmpPackedRefsPrefix)
 	if err != nil {
 		return err
 	}
@@ -428,7 +482,7 @@ func (d *DotGit) rewritePackedRefsWithoutRef(name plumbing.ReferenceName) (err e
 		return err
 	}
 
-	return d.fs.Rename(tmp.Name(), packedRefsPath)
+	return d.commonDir.Rename(tmp.Name(), packedRefsPath)
 }
 
 // process lines from a packed-refs file
@@ -457,7 +511,7 @@ func (d *DotGit) addRefsFromRefDir(refs *[]*plumbing.Reference, seen map[plumbin
 }
 
 func (d *DotGit) walkReferencesTree(refs *[]*plumbing.Reference, relPath []string, seen map[plumbing.ReferenceName]bool) error {
-	files, err := d.fs.ReadDir(d.fs.Join(relPath...))
+	files, err := d.commonDir.ReadDir(d.commonDir.Join(relPath...))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -505,8 +559,15 @@ func (d *DotGit) addRefFromHEAD(refs *[]*plumbing.Reference) error {
 }
 
 func (d *DotGit) readReferenceFile(path, name string) (ref *plumbing.Reference, err error) {
-	path = d.fs.Join(path, d.fs.Join(strings.Split(name, "/")...))
-	f, err := d.fs.Open(path)
+	fs := d.commonDir
+	if name == "HEAD" && d.gitDir != nil {
+		fs = d.gitDir
+		path = d.gitDir.Join(path, d.gitDir.Join(name))
+	} else {
+		path = d.commonDir.Join(path, d.commonDir.Join(strings.Split(name, "/")...))
+	}
+
+	f, err := fs.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -523,7 +584,103 @@ func (d *DotGit) readReferenceFile(path, name string) (ref *plumbing.Reference, 
 
 // Module return a billy.Filesystem poiting to the module folder
 func (d *DotGit) Module(name string) (billy.Filesystem, error) {
-	return d.fs.Chroot(d.fs.Join(modulePath, name))
+	return d.commonDir.Chroot(d.commonDir.Join(modulePath, name))
+}
+
+// Worktrees return a list of worktrees of this repo
+// not include the default one
+func (d *DotGit) Worktrees() ([]worktree.Info, error) {
+	var ret []worktree.Info
+
+	var merr *multierror.Error
+
+	ds, err := d.commonDir.ReadDir(d.commonDir.Join(worktreePath))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ret, nil
+		}
+		return ret, err
+	}
+
+	for _, wd := range ds {
+		if !wd.IsDir() {
+			err = pkgerrs.Errorf("git: worktree %v is should be a dir", wd.Name())
+			merr = multierror.Append(merr, err)
+			continue
+		}
+		f, err := d.commonDir.Open(d.commonDir.Join(worktreePath, wd.Name(), gitdirPath))
+		if err != nil {
+			merr = multierror.Append(merr, err)
+			continue
+		}
+		content, err := stdioutil.ReadAll(f)
+		ioutil.CheckClose(f, &err)
+		if err != nil {
+			err = pkgerrs.Wrap(err, fmt.Sprintf("git: read content of gitdir: %v", wd.Name()))
+			merr = multierror.Append(merr, err)
+			continue
+		}
+		path := strings.TrimSpace(string(content))
+
+		// locked worktree not support
+		st, err := os.Stat(path)
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue
+			}
+			merr = multierror.Append(merr, err)
+			continue
+		}
+
+		if st.IsDir() {
+			err = pkgerrs.Errorf("git: expect gitdir to be a file, %v", path)
+			merr = multierror.Append(merr, err)
+			continue
+		}
+
+		name := filepath.Join(worktreePath, wd.Name(), "HEAD")
+		r, err := d.readReferenceFile(".", name)
+
+		ret = append(ret, worktree.Info{
+			Wt:   filepath.Dir(path),
+			HEAD: r,
+			Name: wd.Name(),
+		})
+	}
+
+	return ret, merr.ErrorOrNil()
+}
+
+// SwitchToWorktree switch to worktree name
+func (d *DotGit) SwitchToWorktree(name string) error {
+	if name == DefaultWorktree {
+		d.gitDir = nil
+		return nil
+	}
+
+	gitPath := filepath.Join(worktreePath, name)
+	gitDir := osfs.New(d.commonDir.Join(gitPath))
+
+	gd, err := newFromGitDir(gitDir)
+	if err != nil {
+		return err
+	}
+
+	d.gitDir = gd.gitDir
+	return nil
+}
+
+func (d *DotGit) SetWorktree(info worktree.Info) error {
+	if err := info.Validate(); err != nil {
+		return err
+	}
+
+	path := d.commonDir.Join(worktreePath, info.Name)
+	if err := d.commonDir.MkdirAll(path, 0755); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func isHex(s string) bool {

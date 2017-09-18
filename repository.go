@@ -882,6 +882,11 @@ func (r *Repository) Worktree() (*Worktree, error) {
 	return &Worktree{r: r, Filesystem: r.wt}, nil
 }
 
+// Worktrees  list worktrees  of this repo
+func (r *Repository) Worktrees() {
+  r.Storer.
+}
+
 // ResolveRevision resolves revision to corresponding hash.
 func (r *Repository) ResolveRevision(rev plumbing.Revision) (*plumbing.Hash, error) {
 	p := revision.NewParserFromString(string(rev))
