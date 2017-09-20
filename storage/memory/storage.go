@@ -2,11 +2,13 @@
 package memory
 
 import (
+	"errors"
 	"fmt"
 
 	"gopkg.in/src-d/go-git.v4/config"
 	"gopkg.in/src-d/go-git.v4/plumbing"
 	"gopkg.in/src-d/go-git.v4/plumbing/format/index"
+	"gopkg.in/src-d/go-git.v4/plumbing/format/worktree"
 	"gopkg.in/src-d/go-git.v4/plumbing/storer"
 	"gopkg.in/src-d/go-git.v4/storage"
 )
@@ -24,6 +26,7 @@ type Storage struct {
 	IndexStorage
 	ReferenceStorage
 	ModuleStorage
+	WorktreeStorage
 }
 
 // NewStorage returns a new Storage base on memory
@@ -234,6 +237,23 @@ func (s *ShallowStorage) SetShallow(commits []plumbing.Hash) error {
 
 func (s ShallowStorage) Shallow() ([]plumbing.Hash, error) {
 	return s, nil
+}
+
+var (
+	ErrNotSupport = errors.New("worktree not support yet")
+)
+
+type WorktreeStorage struct{}
+
+func (wts WorktreeStorage) ListWorktrees() ([]worktree.Info, error) {
+	return nil, ErrNotSupport
+}
+func (wts WorktreeStorage) SetWorktree(wi worktree.Info) error {
+	return ErrNotSupport
+}
+
+func (wts WorktreeStorage) SwitchToWorktree(name string) error {
+	return ErrNotSupport
 }
 
 type ModuleStorage map[string]*Storage

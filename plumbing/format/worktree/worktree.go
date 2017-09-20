@@ -10,6 +10,8 @@ var (
 	ErrInfoNil       = errors.New("Info is nil")
 	ErrHeadNil       = errors.New("Info head is nil")
 	ErrWorktreeEmpty = errors.New("Info worktree empty")
+	ErrDefaultName   = errors.New("name is *default*")
+	ErrNameEmpty     = errors.New("name is empty")
 )
 
 // Info information of a  worktree
@@ -23,6 +25,14 @@ type Info struct {
 func (i *Info) Validate() error {
 	if i == nil {
 		return ErrInfoNil
+	}
+
+	if i.Name == "" {
+		return ErrNameEmpty
+	}
+
+	if i.Name == "default" {
+		return ErrDefaultName
 	}
 
 	if i.HEAD == nil {

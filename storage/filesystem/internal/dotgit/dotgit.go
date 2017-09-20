@@ -623,16 +623,21 @@ func (d *DotGit) Worktrees() ([]worktree.Info, error) {
 		path := strings.TrimSpace(string(content))
 
 		// locked worktree not support
+		// workdir is outside of dotgit, so here we ues os.Stat
 		st, err := os.Stat(path)
-		if err != nil {
-			if os.IsNotExist(err) {
-				continue
-			}
+		if err != nil && !os.IsNotExist(err) {
 			merr = multierror.Append(merr, err)
 			continue
-		}
-
-		if st.IsDir() {
+		} else if os.IsNotExist(err) {
+			//  .git may not exist under worktree
+			// so we further check, if the worktree dir exists
+			dir := filepath.Dir(path)
+			if _, err := os.Stat(dir); err != nil {
+				err = pkgerrs.Wrap(err, "dotgit: stat worktree")
+				merr = multierror.Append(merr, err)
+				continue
+			}
+		} else if st.IsDir() {
 			err = pkgerrs.Errorf("git: expect gitdir to be a file, %v", path)
 			merr = multierror.Append(merr, err)
 			continue
@@ -670,6 +675,8 @@ func (d *DotGit) SwitchToWorktree(name string) error {
 	return nil
 }
 
+// SetWorktree create the worktree dirs, releted file
+// except  index file
 func (d *DotGit) SetWorktree(info worktree.Info) error {
 	if err := info.Validate(); err != nil {
 		return err
@@ -677,6 +684,22 @@ func (d *DotGit) SetWorktree(info worktree.Info) error {
 
 	path := d.commonDir.Join(worktreePath, info.Name)
 	if err := d.commonDir.MkdirAll(path, 0755); err != nil {
+		return err
+	}
+
+	gitDirContent := filepath.Join(info.Wt, ".git")
+	gitDir := d.commonDir.Join(worktreePath, info.Name, gitdirPath)
+	if err := stdioutil.WriteFile(gitDir, []byte(gitDirContent), 0644); err != nil {
+		return err
+	}
+
+	gcdf := d.commonDir.Join(worktreePath, info.Name, commondirPath)
+
+	if err := stdioutil.WriteFile(gcdf, []byte("../.."), 0644); err != nil {
+		return err
+	}
+
+	if err := d.SetRef(info.HEAD); err != nil {
 		return err
 	}
 

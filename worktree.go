@@ -30,6 +30,7 @@ var (
 
 // Worktree represents a git worktree.
 type Worktree struct {
+	Name string
 	// Filesystem underlying filesystem.
 	Filesystem billy.Filesystem
 

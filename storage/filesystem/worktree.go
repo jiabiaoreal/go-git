@@ -12,25 +12,16 @@ type WorktreeStorage struct {
 
 // ListWorktrees list all created worktree except the default
 func (wts WorktreeStorage) ListWorktrees() ([]worktree.Info, error) {
-
-	return nil, nil
+	return wts.ListWorktrees()
 }
 
 // SwitchToWorktree switch to the given worktree
 // if error happens, origin repo not changed
 func (wts WorktreeStorage) SwitchToWorktree(name string) error {
-
-	return nil
+	return wts.SwitchToWorktree(name)
 }
 
 // SetWorktree init a  new worktree
 func (wts WorktreeStorage) SetWorktree(wt worktree.Info) error {
-
-	return nil
-}
-
-// Remove  removes a worktree
-func (wts WorktreeStorage) Remove(name string) error {
-
-	return nil
+	return wts.SetWorktree(wt)
 }

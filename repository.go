@@ -2,24 +2,29 @@ package git
 
 import (
 	"context"
-	"errors"
+
 	"fmt"
 	stdioutil "io/ioutil"
 	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/pkg/errors"
+	"gopkg.in/src-d/go-billy.v3"
+	"gopkg.in/src-d/go-billy.v3/osfs"
 	"gopkg.in/src-d/go-git.v4/config"
 	"gopkg.in/src-d/go-git.v4/internal/revision"
 	"gopkg.in/src-d/go-git.v4/plumbing"
+	"gopkg.in/src-d/go-git.v4/plumbing/format/worktree"
 	"gopkg.in/src-d/go-git.v4/plumbing/object"
 	"gopkg.in/src-d/go-git.v4/plumbing/storer"
 	"gopkg.in/src-d/go-git.v4/storage"
 	"gopkg.in/src-d/go-git.v4/storage/filesystem"
 	"gopkg.in/src-d/go-git.v4/utils/ioutil"
+)
 
-	"gopkg.in/src-d/go-billy.v3"
-	"gopkg.in/src-d/go-billy.v3/osfs"
+const (
+	defaultWorkTree = "default"
 )
 
 var (
@@ -35,7 +40,8 @@ var (
 
 // Repository represents a git repository
 type Repository struct {
-	Storer storage.Storer
+	worktree string
+	Storer   storage.Storer
 
 	r  map[string]*Remote
 	wt billy.Filesystem
@@ -321,9 +327,10 @@ func PlainCloneContext(ctx context.Context, path string, isBare bool, o *CloneOp
 
 func newRepository(s storage.Storer, worktree billy.Filesystem) *Repository {
 	return &Repository{
-		Storer: s,
-		wt:     worktree,
-		r:      make(map[string]*Remote, 0),
+		worktree: defaultWorkTree,
+		Storer:   s,
+		wt:       worktree,
+		r:        make(map[string]*Remote, 0),
 	}
 }
 
@@ -872,19 +879,113 @@ func (r *Repository) References() (storer.ReferenceIter, error) {
 	return r.Storer.IterReferences()
 }
 
-// Worktree returns a worktree based on the given fs, if nil the default
-// worktree will be used.
+// Worktree returns the default worktree based on the given fs
 func (r *Repository) Worktree() (*Worktree, error) {
 	if r.wt == nil {
 		return nil, ErrIsBareRepository
 	}
 
-	return &Worktree{r: r, Filesystem: r.wt}, nil
+	r.worktree = defaultWorkTree
+	return &Worktree{Name: defaultWorkTree, r: r, Filesystem: r.wt}, nil
 }
 
 // Worktrees  list worktrees  of this repo
-func (r *Repository) Worktrees() {
-  r.Storer.
+func (r *Repository) Worktrees() ([]worktree.Info, error) {
+	return r.Storer.ListWorktrees()
+}
+
+// SwitchToWorkTree switch to  another worktree, if it exist
+func (r *Repository) SwitchToWorkTree(name string) (*Worktree, error) {
+	if name == defaultWorkTree {
+		return r.Worktree()
+	}
+
+	i, err := r.getWorktree(name)
+	if err != nil {
+		return nil, err
+	}
+
+	if i == nil {
+		return nil, errors.New("git: worktree does not exist")
+	}
+
+	wt := osfs.New(i.Wt)
+	if err := r.Storer.SwitchToWorktree(name); err != nil {
+		return nil, err
+	}
+
+	r.worktree = name
+	return &Worktree{Name: name, r: r, Filesystem: wt}, nil
+}
+
+func (r *Repository) getWorktree(name string) (*worktree.Info, error) {
+	ws, err := r.Worktrees()
+	if err != nil {
+		return nil, err
+	}
+
+	var i *worktree.Info
+	for _, v := range ws {
+		if v.Name == name {
+			i = &v
+			return i, nil
+		}
+	}
+
+	return i, nil
+}
+
+// NewWorktree create a new worktree under dotgit,
+// but will not touch any file under the worktree
+// if wi.Head is not set, default set to  prod/latest, or idc
+func (r *Repository) NewWorktree(wi worktree.Info) error {
+	if err := wi.Validate(); err != nil {
+		return err
+	}
+
+	// make sure  worktree not already exists
+	i, err := r.getWorktree(wi.Name)
+	if err != nil {
+		return err
+	}
+
+	if i != nil {
+		return errors.New("git: worktree already exists")
+	}
+
+	// decide head
+	if wi.HEAD == nil {
+		h, _ := r.Storer.Reference(plumbing.ReferenceName("prod/latest"))
+		if h == nil {
+			h, _ = r.Storer.Reference(plumbing.ReferenceName("release/idc"))
+		}
+
+		if h == nil {
+			return errors.New("git: tag prod/latest not exist, please specify which branch to checkout from")
+		}
+		wi.HEAD = h
+	}
+
+	// create worktree dirs,  and releted files except index
+	if err := r.Storer.SetWorktree(wi); err != nil {
+		return err
+	}
+
+	// set HEAD
+	ow := r.worktree
+	defer r.SwitchToWorkTree(ow)
+
+	nw, err := r.SwitchToWorkTree(wi.Name)
+	if err != nil {
+		return err
+	}
+
+	ropt := ResetOptions{
+		Commit: wi.HEAD.Hash(),
+		Mode:   MixedReset,
+	}
+
+	return nw.Reset(&ropt)
 }
 
 // ResolveRevision resolves revision to corresponding hash.

@@ -14,6 +14,7 @@ type Storer interface {
 	storer.ReferenceStorer
 	storer.ShallowStorer
 	storer.IndexStorer
+	storer.WorktreeStorer
 	config.ConfigStorer
 	ModuleStorer
 }
@@ -23,10 +24,4 @@ type ModuleStorer interface {
 	// Module returns a Storer representing a submodule, if not exists returns a
 	// new empty Storer is returned
 	Module(name string) (Storer, error)
-}
-
-// Worktreer  worktree storer
-type Worktreer interface {
-	storer.ReferenceStorer
-	storer.IndexStorer
 }
